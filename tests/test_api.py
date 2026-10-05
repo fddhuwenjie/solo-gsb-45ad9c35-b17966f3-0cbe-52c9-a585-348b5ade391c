@@ -1,5 +1,6 @@
 import os
 import tempfile
+import threading
 from pathlib import Path
 
 import pytest
@@ -237,3 +238,92 @@ def test_series_count_validation(client):
         "max_capacity_diff": 5.0, "max_resistance_diff": 0.5,
     })
     assert r.status_code == 422
+
+
+def _begin_uncommitted_group(conn):
+    """在当前线程的连接上模拟一个尚未提交的确认事务。"""
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute(
+        "INSERT INTO groups (chemistry, series_count, limited_capacity, created_at)"
+        " VALUES ('LFP', 4, 97.0, '2026-10-05T00:00:00+00:00')")
+    gid = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+    for cid, cap, res in [("C001", 100.0, 2.0), ("C002", 99.0, 2.1),
+                          ("C003", 98.0, 2.2), ("C004", 97.0, 2.3)]:
+        conn.execute(
+            "INSERT INTO group_cells (group_id, cell_id, capacity, resistance, test_version)"
+            " VALUES (?, ?, ?, ?, 'T1')", (gid, cid, cap, res))
+        conn.execute(
+            "UPDATE cells SET occupied = 1, group_id = ? WHERE cell_id = ?", (gid, cid))
+    return gid
+
+
+def test_uncommitted_group_invisible_to_other_requests(client):
+    """确认事务未提交时，其他请求看不到组记录、快照与临时占用；提交后整组一次性可见。"""
+    seed_six(client)
+    from app import db
+    gid = _begin_uncommitted_group(db.get_conn())  # 本线程连接持有未提交事务
+
+    # 未提交：组列表 / 按编号查询 / 电芯占用 / 预选都看不到事务的中间状态
+    assert client.get("/groups").json()["count"] == 0
+    assert client.get(f"/groups/{gid}").status_code == 404
+    assert all(not c["occupied"] for c in client.get("/cells").json()["cells"])
+    pre = client.post("/preselect", json={
+        "series_count": 4, "min_capacity": 90.0,
+        "max_capacity_diff": 5.0, "max_resistance_diff": 0.5,
+    }).json()
+    assert pre["feasible"] is True
+    assert pre["cell_ids"] == ["C001", "C002", "C003", "C004"]
+
+    # 提交后：整组（组记录 + 快照 + 占用）一次性可见
+    db.get_conn().commit()
+    assert client.get("/groups").json()["count"] == 1
+    snap = client.get(f"/groups/{gid}").json()
+    assert [c["cell_id"] for c in snap["cells"]] == ["C001", "C002", "C003", "C004"]
+    used = {c["cell_id"] for c in client.get("/cells").json()["cells"] if c["occupied"]}
+    assert used == {"C001", "C002", "C003", "C004"}
+
+
+def test_rolled_back_group_leaves_no_trace(client):
+    """确认回滚后，组记录、快照与占用对外毫无痕迹。"""
+    seed_six(client)
+    from app import db
+    conn = db.get_conn()
+    gid = _begin_uncommitted_group(conn)
+    conn.rollback()
+    assert client.get("/groups").json()["count"] == 0
+    assert client.get(f"/groups/{gid}").status_code == 404
+    assert all(not c["occupied"] for c in client.get("/cells").json()["cells"])
+
+
+def test_concurrent_confirm_and_reads_do_not_interfere(client):
+    """并发确认同一候选：只有一个成功；并发查询只看到完整快照，互不干扰。"""
+    seed_six(client)
+    from app.main import app
+    payload = {"cells": [{"cell_id": f"C00{i}", "test_version": "T1"} for i in range(1, 5)]}
+    statuses = []
+    broken = []
+
+    def worker():
+        with TestClient(app) as c:
+            r = c.post("/groups/confirm", json=payload)
+            statuses.append(r.status_code)
+            for _ in range(10):
+                # 组列表里出现的任何组都必须带完整快照
+                for g in c.get("/groups").json()["groups"]:
+                    if len(g["cells"]) != g["series_count"]:
+                        broken.append(g)
+                # 已提交的占用必须整组可见，不允许只看到部分占用
+                members = [cell["cell_id"] for cell in c.get("/cells").json()["cells"]
+                           if cell["occupied"]]
+                if members and len(members) != 4:
+                    broken.append(members)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert statuses.count(201) == 1
+    assert statuses.count(409) == 3
+    assert not broken
+    assert client.get("/groups").json()["count"] == 1

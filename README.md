@@ -42,6 +42,11 @@ python -m pytest tests/ -q
   或已被别组占用，则**整组拒绝、回滚，不留部分占用**。
 - **快照不可改写**：`groups` / `group_cells` 表由触发器禁止 UPDATE/DELETE，可按组
   编号 `GET /groups/{group_id}` 查询，后续检测修订不影响已确认组。
+- **并发可见性**：每个请求使用各自线程的独立 SQLite 连接（WAL 模式），查询只能
+  看到**已提交的完整快照**。确认事务提交前，`GET /groups`、`GET /groups/{id}`
+  看不到该组，`GET /cells`、`POST /preselect` 也看不到临时占用；提交成功的瞬间
+  整组（组记录 + 快照 + 占用）一次性可见，回滚则毫无痕迹。并发查询不会阻塞、
+  也不会干扰确认事务。
 
 ## API 一览
 
@@ -141,12 +146,44 @@ curl -s -X POST http://localhost:8000/groups/confirm \
 已被别组抢先占用的电芯再次确认时同样返回 `409` 并整组拒绝。确认后对电芯的复测
 修订不会改变 `GET /groups/{group_id}` 返回的快照内容。
 
+### 6. 并发查询（确认事务与读取互不干扰）
+
+确认事务提交前，其他请求看不到它的任何中间状态；提交成功的瞬间，整组
+（组记录、检测快照、电芯占用）对所有请求一次性可见：
+
+```bash
+# 后台发起确认，同时并发轮询组列表、按编号查询与电芯占用
+curl -s -X POST http://localhost:8000/groups/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"cells":[
+        {"cell_id":"C001","test_version":"T1"},
+        {"cell_id":"C002","test_version":"T1"},
+        {"cell_id":"C003","test_version":"T1"},
+        {"cell_id":"C004","test_version":"T1"}]}' &
+
+for i in 1 2 3 4 5; do
+  curl -s http://localhost:8000/groups;    echo  # 提交前不含新组，提交后整组出现
+  curl -s http://localhost:8000/groups/1;  echo  # 提交前 404，提交后 200 且快照完整
+  curl -s http://localhost:8000/cells;     echo  # 提交前 C001~C004 仍未占用，提交后整组占用
+done
+wait
+```
+
+观测要点：
+
+- `/groups` 与 `/groups/{id}` 只会看到**已提交的完整快照**：确认未提交时查不到
+  该组；若确认失败回滚，该组始终不可见。
+- `/cells` 与 `/preselect` 在确认提交前看不到临时占用；提交成功后整组占用
+  一次性可见。
+- 读取与确认并发执行互不影响：读取永远拿到一致的已提交状态，确认事务照常
+  原子提交或整组回滚。
+
 ## 项目结构
 
 ```
 app/
   main.py       # FastAPI 路由：录入 / 复测 / 预选 / 确认 / 快照查询
-  db.py         # SQLite 连接、schema、不可改写触发器、写锁
+  db.py         # 每线程 SQLite 连接（WAL）、schema、不可改写触发器、写锁
   selection.py  # 成组预选算法（穷举组合，最多 C(12,6)=924 种）
   schemas.py    # Pydantic 请求模型（串联节数 3~6 等校验）
 tests/test_api.py

@@ -2,6 +2,9 @@
 
 流程：录入电芯 -> 预选（只读，返回候选与检测版本）-> 确认（单事务重查版本与
 占用状态，原子占用整组并写入不可改写的检测快照）。
+
+每个请求使用各自线程的 SQLite 连接：查询只能看到已提交的完整快照，
+确认事务未提交的组记录、快照与临时占用对其他请求不可见。
 """
 from datetime import datetime, timezone
 
@@ -60,6 +63,7 @@ def create_cell(body: CellCreate):
 
 @app.get("/cells")
 def list_cells():
+    """电芯列表：只反映已提交的占用状态（确认提交后才看到整组占用）。"""
     conn = db.get_conn()
     rows = conn.execute("SELECT * FROM cells ORDER BY cell_id").fetchall()
     return {"count": len(rows), "cells": [_row_to_cell(r) for r in rows]}
@@ -105,7 +109,10 @@ def revise_test(cell_id: str, body: TestRevision):
 
 @app.post("/preselect")
 def preselect(body: PreselectRequest):
-    """按串联要求预选一组同体系、未占用电芯（只读，不占用）。"""
+    """按串联要求预选一组同体系、未占用电芯（只读，不占用）。
+
+    只统计已提交的占用状态：确认事务未提交的临时占用不可见。
+    """
     conn = db.get_conn()
     rows = conn.execute("SELECT * FROM cells WHERE occupied = 0").fetchall()
     free = [_row_to_cell(r) for r in rows]
@@ -268,14 +275,17 @@ def _group_payload(conn, group_id: int) -> dict:
 
 @app.get("/groups")
 def list_groups():
+    """组列表：同一已提交快照内的完整组（确认事务未提交的组不可见）。"""
     conn = db.get_conn()
-    rows = conn.execute("SELECT group_id FROM groups ORDER BY group_id").fetchall()
-    return {"count": len(rows), "groups": [_group_payload(conn, r["group_id"]) for r in rows]}
+    with db.read_snapshot(conn):
+        rows = conn.execute("SELECT group_id FROM groups ORDER BY group_id").fetchall()
+        groups = [_group_payload(conn, r["group_id"]) for r in rows]
+    return {"count": len(groups), "groups": groups}
 
 
 @app.get("/groups/{group_id}")
 def get_group(group_id: int):
-    """按组编号查询不可改写的检测快照。"""
+    """按组编号查询不可改写的检测快照（未提交或已回滚的组不可见）。"""
     conn = db.get_conn()
     g = conn.execute("SELECT 1 FROM groups WHERE group_id = ?", (group_id,)).fetchone()
     if g is None:
