@@ -51,27 +51,30 @@ def create_cell(body: CellCreate):
                     raise HTTPException(409, f"电芯 {body.cell_id} 已存在")
                 raise
             conn.commit()
+            # 回读放在写锁内：写连接仅在锁内使用，避免读到其他写事务的中间状态
+            row = conn.execute(
+                "SELECT * FROM cells WHERE cell_id = ?", (body.cell_id,)
+            ).fetchone()
+            return _row_to_cell(row)
         except Exception:
             conn.rollback()
             raise
-    row = conn.execute("SELECT * FROM cells WHERE cell_id = ?", (body.cell_id,)).fetchone()
-    return _row_to_cell(row)
 
 
 @app.get("/cells")
 def list_cells():
-    conn = db.get_conn()
-    rows = conn.execute("SELECT * FROM cells ORDER BY cell_id").fetchall()
-    return {"count": len(rows), "cells": [_row_to_cell(r) for r in rows]}
+    with db.read_connection() as conn:
+        rows = conn.execute("SELECT * FROM cells ORDER BY cell_id").fetchall()
+        return {"count": len(rows), "cells": [_row_to_cell(r) for r in rows]}
 
 
 @app.get("/cells/{cell_id}")
 def get_cell(cell_id: str):
-    conn = db.get_conn()
-    row = conn.execute("SELECT * FROM cells WHERE cell_id = ?", (cell_id,)).fetchone()
-    if row is None:
-        raise HTTPException(404, f"电芯 {cell_id} 不存在")
-    return _row_to_cell(row)
+    with db.read_connection() as conn:
+        row = conn.execute("SELECT * FROM cells WHERE cell_id = ?", (cell_id,)).fetchone()
+        if row is None:
+            raise HTTPException(404, f"电芯 {cell_id} 不存在")
+        return _row_to_cell(row)
 
 
 @app.put("/cells/{cell_id}/test")
@@ -94,11 +97,13 @@ def revise_test(cell_id: str, body: TestRevision):
                 (body.capacity, body.resistance, body.test_version, cell_id),
             )
             conn.commit()
+            row = conn.execute(
+                "SELECT * FROM cells WHERE cell_id = ?", (cell_id,)
+            ).fetchone()
+            return _row_to_cell(row)
         except Exception:
             conn.rollback()
             raise
-    row = conn.execute("SELECT * FROM cells WHERE cell_id = ?", (cell_id,)).fetchone()
-    return _row_to_cell(row)
 
 
 # ---------- 预选 ----------
@@ -106,9 +111,9 @@ def revise_test(cell_id: str, body: TestRevision):
 @app.post("/preselect")
 def preselect(body: PreselectRequest):
     """按串联要求预选一组同体系、未占用电芯（只读，不占用）。"""
-    conn = db.get_conn()
-    rows = conn.execute("SELECT * FROM cells WHERE occupied = 0").fetchall()
-    free = [_row_to_cell(r) for r in rows]
+    with db.read_connection() as conn:
+        rows = conn.execute("SELECT * FROM cells WHERE occupied = 0").fetchall()
+        free = [_row_to_cell(r) for r in rows]
     if body.chemistry is not None:
         free = [c for c in free if c["chemistry"] == body.chemistry]
 
@@ -237,10 +242,11 @@ def confirm_group(body: ConfirmRequest):
                     (group_id, i),
                 )
             conn.commit()
+            # 提交后仍在写锁内回读完整快照；读路径用独立连接，提交后才能看到本组
+            return _group_payload(conn, group_id)
         except Exception:
             conn.rollback()  # 整组拒绝：不留下任何部分占用
             raise
-    return _group_payload(conn, group_id)
 
 
 def _group_payload(conn, group_id: int) -> dict:
@@ -268,16 +274,18 @@ def _group_payload(conn, group_id: int) -> dict:
 
 @app.get("/groups")
 def list_groups():
-    conn = db.get_conn()
-    rows = conn.execute("SELECT group_id FROM groups ORDER BY group_id").fetchall()
-    return {"count": len(rows), "groups": [_group_payload(conn, r["group_id"]) for r in rows]}
+    """只列出已提交的完整组：未提交/已回滚的确认事务对读连接不可见。"""
+    with db.read_connection() as conn:
+        rows = conn.execute("SELECT group_id FROM groups ORDER BY group_id").fetchall()
+        return {"count": len(rows),
+                "groups": [_group_payload(conn, r["group_id"]) for r in rows]}
 
 
 @app.get("/groups/{group_id}")
 def get_group(group_id: int):
-    """按组编号查询不可改写的检测快照。"""
-    conn = db.get_conn()
-    g = conn.execute("SELECT 1 FROM groups WHERE group_id = ?", (group_id,)).fetchone()
-    if g is None:
-        raise HTTPException(404, f"组 {group_id} 不存在")
-    return _group_payload(conn, group_id)
+    """按组编号查询不可改写的检测快照（仅已提交组可见，否则按既有规则 404）。"""
+    with db.read_connection() as conn:
+        g = conn.execute("SELECT 1 FROM groups WHERE group_id = ?", (group_id,)).fetchone()
+        if g is None:
+            raise HTTPException(404, f"组 {group_id} 不存在")
+        return _group_payload(conn, group_id)

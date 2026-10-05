@@ -39,7 +39,11 @@ python -m pytest tests/ -q
   （= 组内最小容量）及各芯检测版本；无可行组合时返回原因。
 - **确认**：在**一次 SQLite 事务**（`BEGIN IMMEDIATE`）中重查所有电芯的检测版本与
   未占用状态，全部一致才原子地占用整组、写入组记录与检测快照；任何一节版本已变化
-  或已被别组占用，则**整组拒绝、回滚，不留部分占用**。
+  或已被别组占用，则**整组拒绝、回滚，不留部分占用**。确认事务期间，`GET /groups`、
+  `GET /groups/{group_id}`、`GET /cells`、`POST /preselect` 经由独立只读连接读取，
+  **只能看到已提交的完整快照**：未提交或被回滚的确认一律不可见（按组编号查询仍按
+  既有规则返回 `404`）；只有确认成功提交后，各查询接口才统一看到整组占用。数据库开启
+  WAL，只读请求不会阻塞确认事务，并发确认则由写锁串行化（后到者整组拒绝）。
 - **快照不可改写**：`groups` / `group_cells` 表由触发器禁止 UPDATE/DELETE，可按组
   编号 `GET /groups/{group_id}` 查询，后续检测修订不影响已确认组。
 
@@ -141,12 +145,59 @@ curl -s -X POST http://localhost:8000/groups/confirm \
 已被别组抢先占用的电芯再次确认时同样返回 `409` 并整组拒绝。确认后对电芯的复测
 修订不会改变 `GET /groups/{group_id}` 返回的快照内容。
 
+### 6. 并发查询：确认进行中只读已提交快照
+
+确认接口在单事务内完成"写组记录 → 写每节快照 → 更新占用"。可以在确认进行的同时
+并发发起查询：进行中的组不会出现在组列表中（按编号查询返回 `404`），电芯占用与
+预选结果也保持上一个已提交状态；确认成功后所有接口立即统一看到整组结果。
+
+一边确认、一边并发查询（shell）：
+
+```bash
+# 后台发起确认
+curl -s -X POST http://localhost:8000/groups/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"cells":[
+        {"cell_id":"C001","test_version":"T1"},
+        {"cell_id":"C002","test_version":"T1"},
+        {"cell_id":"C003","test_version":"T1"},
+        {"cell_id":"C004","test_version":"T1"}]}' &
+
+# 并发查询：确认未提交前 count 只会是 0（或此前已提交的组数），
+# 提交后才变为 1；/groups/1 在提交前返回 404，提交后返回完整快照
+for i in $(seq 1 10); do
+  curl -s http://localhost:8000/groups
+  echo
+done
+wait
+```
+
+并发发起两个重叠确认时，只有一个返回 `201`，另一个按"已被占用、候选过期"整组
+拒绝（`409`），不会产生部分占用：
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+import httpx
+
+payload = {"cells": [{"cell_id": cid, "test_version": "T1"}
+                     for cid in ["C001", "C002", "C003", "C004"]]}
+
+with httpx.Client(base_url="http://localhost:8000") as client, \
+        ThreadPoolExecutor(max_workers=2) as pool:
+    statuses = list(pool.map(
+        lambda _: client.post("/groups/confirm", json=payload).status_code,
+        range(2),
+    ))
+    print(sorted(statuses))  # [201, 409]：一个成功，一个整组拒绝
+    print(client.get("/groups").json()["count"])  # 1：只产生一个完整组
+```
+
 ## 项目结构
 
 ```
 app/
   main.py       # FastAPI 路由：录入 / 复测 / 预选 / 确认 / 快照查询
-  db.py         # SQLite 连接、schema、不可改写触发器、写锁
+  db.py         # SQLite 连接（单写连接+写锁 / 每请求只读连接、WAL、schema、不可改写触发器）
   selection.py  # 成组预选算法（穷举组合，最多 C(12,6)=924 种）
   schemas.py    # Pydantic 请求模型（串联节数 3~6 等校验）
 tests/test_api.py

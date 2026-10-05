@@ -1,5 +1,6 @@
 import os
 import tempfile
+import threading
 from pathlib import Path
 
 import pytest
@@ -237,3 +238,159 @@ def test_series_count_validation(client):
         "max_capacity_diff": 5.0, "max_resistance_diff": 0.5,
     })
     assert r.status_code == 422
+
+
+# ---------- 并发：确认事务进行中的跨请求读取 ----------
+
+def _hold_uncommitted_confirm(client, cell_ids):
+    """在写连接上开启确认事务但不提交：组记录已插入、快照/占用写了一半的状态。
+
+    返回 (event_release, thread)：event 置位后事务回滚（模拟确认被拒）。
+    """
+    from app import db
+    released = threading.Event()
+
+    def worker():
+        conn = db.get_conn()
+        with db.write_lock:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT INTO groups (chemistry, series_count, limited_capacity, created_at)"
+                " VALUES ('LFP', ?, 97.0, '2026-10-05T00:00:00+00:00')",
+                (len(cell_ids),),
+            )
+            group_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            # 只写第一节的快照：故意停在“快照尚未写齐”的中间状态
+            conn.execute(
+                "INSERT INTO group_cells (group_id, cell_id, capacity, resistance,"
+                " test_version) VALUES (?, 'C001', 100.0, 2.0, 'T1')",
+                (group_id,),
+            )
+            conn.execute("UPDATE cells SET occupied = 1, group_id = ?"
+                         " WHERE cell_id = 'C001'", (group_id,))
+            released.wait()
+            conn.rollback()
+
+    t = threading.Thread(target=worker)
+    t.start()
+    # 等待事务实际开始（写锁被持有即代表 INSERT 已执行）
+    while not db.write_lock.locked():
+        pass
+    return released, t
+
+
+def test_uncommitted_confirm_invisible_to_group_reads(client):
+    """确认未提交时：组列表/按编号查询只能看到已提交的完整快照。"""
+    seed_six(client)
+    released, t = _hold_uncommitted_confirm(client, ["C001", "C002", "C003", "C004"])
+    try:
+        assert client.get("/groups").json()["count"] == 0
+        r = client.get("/groups/1")
+        assert r.status_code == 404  # 未提交组按现有规则不可查
+        # 单节电芯查询同样看不到临时占用
+        assert client.get("/cells/C001").json()["occupied"] is False
+    finally:
+        released.set()
+        t.join()
+    # 回滚后：组彻底不存在，占用消失，仿佛确认从未发生
+    assert client.get("/groups").json()["count"] == 0
+    assert client.get("/groups/1").status_code == 404
+    assert all(not c["occupied"]
+               for c in client.get("/cells").json()["cells"])
+
+
+def test_uncommitted_occupancy_invisible_to_preselect(client):
+    """确认未提交时：预选不得提前看到临时占用，仍按已提交状态选 C001..C004。"""
+    seed_six(client)
+    released, t = _hold_uncommitted_confirm(client, ["C001", "C002", "C003", "C004"])
+    try:
+        body = client.post("/preselect", json={
+            "series_count": 4, "min_capacity": 90.0,
+            "max_capacity_diff": 5.0, "max_resistance_diff": 0.5,
+        }).json()
+        assert body["feasible"] is True
+        assert body["cell_ids"] == ["C001", "C002", "C003", "C004"]
+    finally:
+        released.set()
+        t.join()
+
+
+def test_committed_confirm_visible_atomically(client):
+    """确认提交后：组列表/按编号/电芯占用/预选统一看到整组结果。"""
+    seed_six(client)
+    pre = client.post("/preselect", json={
+        "series_count": 4, "min_capacity": 90.0,
+        "max_capacity_diff": 5.0, "max_resistance_diff": 0.5,
+    }).json()
+    payload = {"cells": [{"cell_id": c["cell_id"], "test_version": c["test_version"]}
+                         for c in pre["cells"]]}
+    assert client.post("/groups/confirm", json=payload).status_code == 201
+
+    groups = client.get("/groups").json()
+    assert groups["count"] == 1
+    assert groups["groups"][0]["cells"] == client.get("/groups/1").json()["cells"]
+    occupied = {c["cell_id"] for c in client.get("/cells").json()["cells"]
+                if c["occupied"]}
+    assert occupied == set(pre["cell_ids"])
+    # 已占用 4 节后，预选只能从剩余 2 节里选 -> 不足 4 节
+    body = client.post("/preselect", json={
+        "series_count": 4, "min_capacity": 90.0,
+        "max_capacity_diff": 5.0, "max_resistance_diff": 0.5,
+    }).json()
+    assert body["feasible"] is False
+
+
+def test_concurrent_confirms_do_not_interfere(client):
+    """并发请求不得干扰确认事务：两个重叠确认只有一个成功，另一个整组拒绝。"""
+    seed_six(client)
+    payload = {"cells": [
+        {"cell_id": cid, "test_version": "T1"}
+        for cid in ["C001", "C002", "C003", "C004"]
+    ]}
+    results = []
+
+    def confirm():
+        results.append(client.post("/groups/confirm", json=payload).status_code)
+
+    threads = [threading.Thread(target=confirm) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert sorted(results) == [201, 409]
+    # 只有一个组、无部分占用
+    assert client.get("/groups").json()["count"] == 1
+    occupied = [c for c in client.get("/cells").json()["cells"] if c["occupied"]]
+    assert len(occupied) == 4
+    assert all(c["group_id"] == 1 for c in occupied)
+
+
+def test_reads_during_real_confirm_never_see_partial_state(client):
+    """真实确认进行中并发读取：任何时刻组要么完整存在，要么完全不存在。"""
+    seed_six(client)
+    payload = {"cells": [
+        {"cell_id": cid, "test_version": "T1"}
+        for cid in ["C001", "C002", "C003", "C004"]
+    ]}
+    errors = []
+
+    def reader():
+        for _ in range(50):
+            groups = client.get("/groups").json()["groups"]
+            for g in groups:
+                # 不允许出现“组记录已在但快照写了一半”的半成品
+                if len(g["cells"]) != g["series_count"]:
+                    errors.append(f"partial group {g['group_id']}: "
+                                  f"{len(g['cells'])}/{g['series_count']}")
+            # 占用状态必须以整组为单位：要么 0 节，要么 4 节
+            n = sum(1 for c in client.get("/cells").json()["cells"]
+                    if c["occupied"])
+            if n not in (0, 4):
+                errors.append(f"partial occupancy: {n}")
+
+    rthread = threading.Thread(target=reader)
+    rthread.start()
+    assert client.post("/groups/confirm", json=payload).status_code == 201
+    rthread.join()
+    assert errors == []
